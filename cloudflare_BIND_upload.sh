@@ -33,7 +33,6 @@ readonly BACKUP_DIR="/tmp/cf_dns_backups"
 readonly ZONE_DIR="/etc/bind/zones"
 readonly CF_API="https://api.cloudflare.com/client/v4"
 
-
 die() { echo "Error! $*" >&2; exit 1; }
 
 cf_get() {
@@ -71,8 +70,7 @@ check_success() {
     return 0
 }
 
-# ── config ───────────────────────────────────────────────────────────────────
-
+# CONFIG
 [[ -f "$INI_FILE" ]] || die "$INI_FILE not found."
 
 CF_SECTION=$(awk '/\[CLOUDFLARE\]/{flag=1;next}/\[/{flag=0}flag' "$INI_FILE")
@@ -85,16 +83,13 @@ PROXIED=$(echo "$CF_SECTION" | awk -F= '/^cf_proxy=/{gsub(/^[[:space:]]+|[[:spac
 [[ -z "$KEY"     ]] && { echo "Skipping: Cloudflare external DNS server is not configured." ; exit 0; }
 [[ -z "$PROXIED" ]] && { echo "Skipping: Cloudflare external DNS server is not configured." ; exit 0; }
 
-# Validate PROXIED value
 if [[ "$PROXIED" != "true" && "$PROXIED" != "false" ]]; then
     die "cf_proxy must be 'true' or 'false', got: '$PROXIED'"
 fi
 
 mkdir -p "$BACKUP_DIR" || die "Cannot create backup directory $BACKUP_DIR"
 
-# ── zone discovery ────────────────────────────────────────────────────────────
-
-# Safely handle empty glob (bash 4+)
+# GET ZONES
 shopt -s nullglob
 ZONE_FILES=("$ZONE_DIR"/*.zone)
 shopt -u nullglob
@@ -105,8 +100,7 @@ if [[ $TOTAL -eq 0 ]]; then
     exit 0
 fi
 
-# ── main loop ─────────────────────────────────────────────────────────────────
-
+# MAIN
 START_TIME=$(date +%s)
 COUNTER=0
 ERRORS=0
@@ -131,7 +125,7 @@ for FILE in "${ZONE_FILES[@]}"; do
     fi
     echo "  Zone ID: $ZONE_ID"
 
-    # 2. Backup — abort this domain if backup is empty/fails
+    # 2. Backup
     BACKUP_CONTENT=$(cf_get "/zones/${ZONE_ID}/dns_records/export")
     if [[ -z "$BACKUP_CONTENT" ]]; then
         echo "  Error: Backup returned empty response for $DOMAIN — skipping (records NOT deleted)."
@@ -141,7 +135,7 @@ for FILE in "${ZONE_FILES[@]}"; do
     echo "$BACKUP_CONTENT" > "$BACKUP_FILE"
     echo "  Backed up DNS records → $BACKUP_FILE"
 
-    # 3. Delete all existing DNS records (mapfile avoids subshell bug)
+    # 3. Delete all existing DNS records
     RECORDS_RESP=$(cf_get "/zones/${ZONE_ID}/dns_records?per_page=500")
     mapfile -t RECORD_IDS < <(echo "$RECORDS_RESP" | jq -r '.result[].id')
 
@@ -165,8 +159,7 @@ for FILE in "${ZONE_FILES[@]}"; do
     fi
 done
 
-# ── summary ───────────────────────────────────────────────────────────────────
-
+# SUMMARY
 END_TIME=$(date +%s)
 ELAPSED=$(( END_TIME - START_TIME ))
 ELAPSED_HMS=$(printf '%02d:%02d:%02d' $((ELAPSED/3600)) $(( (ELAPSED%3600)/60 )) $((ELAPSED%60)))
