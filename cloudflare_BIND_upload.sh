@@ -27,72 +27,101 @@
 # SOFTWARE.
 #
 #------------------------------------------------------------------------------#
-## Uncomment for debugging purpose
-#set -o errexit
-#set -o pipefail
-#set -o nounset
-#set -o xtrace
-# Detect absolute and full path as well as filename of this script
-cd "$(dirname "$0")" || exit
-CURRDIR=$(pwd)
-cd - > /dev/null || exit
 
-# Check input
-check_input() {
-  echo ""
-  echo -e "Cloudflare BIND Zone File Upload"
-  echo ""
-  echo -e "Usage: ./cloudflare_BIND_upload.sh  [Auth-Email] [Auth-Key] [Zone ID] [Domain] [Proxied (true/false)]"
-  echo ""
-}
+readonly INI_FILE="/etc/openpanel/openadmin/config/admin.ini"
+readonly BACKUP_DIR="/tmp/cf_dns_backups"
+readonly ZONE_DIR="/etc/bind/zones"
 
-INPUT_CHECK=$(check_input)
-
-#check command input
-if [[ -z "$1" && -z "$2" && -z "$3" && -z "$4" && -z "$5" ]];
-then
-  echo -e "${INPUT_CHECK}"
-  exit 0
+# Check if the file exists
+if [ ! -f "$INI_FILE" ]; then
+    echo "Error! $INI_FILE not found."
+    exit 1
 fi
 
-EMAIL=$1
-KEY=$2
-ZONE_ID=$3
-DOMAIN=$4
-PROXIED=$5
+START_TIME=$(date +%s)
 
-FILE="$(find /var -name $DOMAIN.hosts)"
+# Read values from [CLOUDFLARE] section
+CF_SECTION=$(awk '/\[CLOUDFLARE\]/{flag=1;next}/\[/{flag=0}flag' "$INI_FILE")
 
-if [ ! -f "$FILE" ]; then
-    echo "Error! BIND File not found"
+EMAIL=$(echo "$CF_SECTION" | grep -E '^cf_email=' | cut -d'=' -f2 | xargs)
+KEY=$(echo "$CF_SECTION" | grep -E '^cf_key=' | cut -d'=' -f2 | xargs)
+PROXIED=$(echo "$CF_SECTION" | grep -E '^cf_proxy=' | cut -d'=' -f2 | xargs)
+
+if [[ -z "$EMAIL" || -z "$KEY" || -z "$PROXIED" ]]; then
+    echo "Skipping: Cloudflare external DNS server is not configured."
     exit 0
 fi
 
-cd "${CURRDIR}" || exit
-cp -rp $FILE $DOMAIN.txt
-DOMAIN_FILE=./$DOMAIN.txt
-# Export DNS Records
-curl -X GET "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/dns_records/export" \
- -H "X-Auth-Email: ${EMAIL}" \
- -H "X-Auth-Key: ${KEY}" \
- -H "Content-Type: application/json" > ./$DOMAIN.txt.bak
- echo "Current DNS records backed up to ./$DOMAIN.txt.bak"
-# Get Record IDs
-curl -X GET https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/dns_records?per_page=500 \
-     -H "X-Auth-Email: ${EMAIL}" \
-     -H "X-Auth-Key: ${KEY}" \
-     -H "Content-Type: application/json" | jq .result[].id |  tr -d '"' | (
-  while read id; do
-    # Delete ALL records
-    curl -X DELETE https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/dns_records/${id} \
-      -H "X-Auth-Email: ${EMAIL}" \
-      -H "X-Auth-Key: ${KEY}" \
-      -H "Content-Type: application/json"
-  done
-  # Upload BIND file to Cloudflare
-  curl -X POST "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/dns_records/import" \
-       -H "X-Auth-Email: ${EMAIL}" \
-       -H "X-Auth-Key: ${KEY}" \
-       --form "file=@$DOMAIN_FILE" \
-       --form "proxied=$PROXIED"
-  )
+mkdir -p "$BACKUP_DIR"
+
+# Get list of zone files
+ZONE_FILES=("$ZONE_DIR"/*.zone)
+TOTAL=${#ZONE_FILES[@]}
+
+if [[ $TOTAL -eq 0 ]]; then
+    echo "No .zone files found in $ZONE_DIR"
+    exit 0
+fi
+
+# Counter
+COUNTER=0
+
+for FILE in "${ZONE_FILES[@]}"; do
+    ((COUNTER++))
+    DOMAIN=$(basename "$FILE" .zone)
+    echo ""
+    echo "[$COUNTER/$TOTAL] Processing domain: $DOMAIN"
+
+    TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+    BACKUP_FILE="${BACKUP_DIR}/${DOMAIN}_${TIMESTAMP}.bak"
+
+    # 1. Get Zone ID from Cloudflare
+    ZONE_ID=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones?name=${DOMAIN}" \
+        -H "X-Auth-Email: ${EMAIL}" \
+        -H "X-Auth-Key: ${KEY}" \
+        -H "Content-Type: application/json" | jq -r '.result[0].id')
+
+    if [ -z "$ZONE_ID" ] || [ "$ZONE_ID" == "null" ]; then
+        echo "Error! Could not fetch Zone ID for $DOMAIN, skipping..."
+        continue
+    fi
+
+    echo "Zone ID: $ZONE_ID"
+
+    # 2. Backup current DNS records
+    curl -s -X GET "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/dns_records/export" \
+        -H "X-Auth-Email: ${EMAIL}" \
+        -H "X-Auth-Key: ${KEY}" \
+        -H "Content-Type: application/json" > "$BACKUP_FILE"
+
+    echo "Backed up current DNS records to $BACKUP_FILE"
+
+    # 3. Delete all existing DNS records
+    curl -s -X GET "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/dns_records?per_page=500" \
+        -H "X-Auth-Email: ${EMAIL}" \
+        -H "X-Auth-Key: ${KEY}" \
+        -H "Content-Type: application/json" | jq -r '.result[].id' | while read id; do
+        curl -s -X DELETE "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/dns_records/${id}" \
+            -H "X-Auth-Email: ${EMAIL}" \
+            -H "X-Auth-Key: ${KEY}" \
+            -H "Content-Type: application/json"
+    done
+
+    # 4. Upload the BIND file
+    curl -s -X POST "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/dns_records/import" \
+        -H "X-Auth-Email: ${EMAIL}" \
+        -H "X-Auth-Key: ${KEY}" \
+        --form "file=@${FILE}" \
+        --form "proxied=$PROXIED"
+
+    echo "Imported BIND file for $DOMAIN"
+done
+
+END_TIME=$(date +%s)
+ELAPSED=$((END_TIME - START_TIME))
+
+ELAPSED_HMS=$(printf '%02d:%02d:%02d' $((ELAPSED/3600)) $(( (ELAPSED%3600)/60 )) $((ELAPSED%60)))
+
+echo ""
+echo "All $TOTAL domains processed."
+echo "Total time: $ELAPSED_HMS (HH:MM:SS)"
